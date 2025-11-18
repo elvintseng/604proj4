@@ -1,0 +1,666 @@
+import os
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
+from sklearn.preprocessing import StandardScaler
+import joblib
+
+# ================================
+# Configuration
+# ================================
+
+METERED_DIR = Path(os.environ.get("METERED_DIR", "data"))
+WEATHER_DIR = Path(os.environ.get("WEATHER_DIR", "data/weather_cities"))
+
+TRAIN_START = date(2016, 1, 1)
+TRAIN_END = date(2023, 12, 31)
+
+FORECAST_YEAR = 2025
+NOV_START = date(FORECAST_YEAR, 11, 1)
+NOV_END = date(FORECAST_YEAR, 11, 29)
+
+# ================================
+# Basic utilities
+# ================================
+
+def thanksgiving_date(year: int) -> date:
+    """US Thanksgiving (4th Thursday in November)."""
+    d = date(year, 11, 1)
+    w = d.weekday()  # Monday=0 ... Sunday=6
+    days_to_thu = (3 - w) % 7
+    first_thu = d + timedelta(days=days_to_thu)
+    return first_thu + timedelta(weeks=3)
+
+
+def load_metered_data(metered_dir: Path) -> pd.DataFrame:
+    """
+    Load all hrl_load_metered_*.csv into one DataFrame.
+
+    Expected columns:
+      - datetime_beginning_ept
+      - load_area (or zone)
+      - mw
+    """
+    csvs = sorted(metered_dir.glob("hrl_load_metered_*.csv"))
+    if not csvs:
+        raise FileNotFoundError(f"No hrl_load_metered_*.csv found in {metered_dir}")
+
+    frames = []
+    for f in csvs:
+        df = pd.read_csv(f)
+
+        # Standardize zone column
+        cols = df.columns
+
+        # If both 'zone' and 'load_area' exist, drop one and keep a single name
+        if "zone" in cols and "load_area" in cols:
+            # assume 'load_area' is redundant in that case
+            df = df.drop(columns=["load_area"])
+
+        if "zone" not in df.columns:
+            if "load_area" in df.columns:
+                df = df.rename(columns={"load_area": "zone"})
+            else:
+                raise ValueError(f"{f} has neither 'zone' nor 'load_area' column")
+
+        # Parse PJM timestamp
+        if "timestamp" not in df.columns:
+            df["timestamp"] = pd.to_datetime(
+                df["datetime_beginning_ept"],
+                format="%m/%d/%Y %I:%M:%S %p",
+                errors="raise",
+            )
+
+        df["date"] = df["timestamp"].dt.date
+        df["hour"] = df["timestamp"].dt.hour
+
+        frames.append(df)
+
+    out = pd.concat(frames, ignore_index=True)
+
+    # Drop any duplicated column names that might still exist
+    out = out.loc[:, ~out.columns.duplicated()]
+
+    return out
+
+
+
+def load_weather_data(weather_dir: Path) -> pd.DataFrame:
+    """
+    Load precomputed weather CSVs from data/weather_cities.
+
+    We assume each file has at least:
+      - zone
+      - either:
+          - timestamp (datetime-like), or
+          - date + hour columns
+      - temperature column 'temp_c'
+    """
+    csvs = sorted(weather_dir.glob("*.csv"))
+    if not csvs:
+        raise FileNotFoundError(f"No weather CSVs found in {weather_dir}")
+
+    frames = []
+    for f in csvs:
+        df = pd.read_csv(f)
+
+        # ----- Build/standardize timestamp -----
+        if "timestamp" not in df.columns:
+            if {"date", "hour"}.issubset(df.columns):
+                date_col = pd.to_datetime(df["date"])
+                hour_col = pd.to_numeric(df["hour"], errors="coerce").fillna(0).astype(int)
+                df["timestamp"] = date_col + pd.to_timedelta(hour_col, unit="h")
+            else:
+                raise ValueError(
+                    f"{f} has no 'timestamp' and no ('date','hour') to construct it."
+                )
+        else:
+            # If timestamp exists, force it to datetime
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        # ----- Standardize date -----
+        if "date" not in df.columns:
+            df["date"] = df["timestamp"].dt.date
+        else:
+            df["date"] = pd.to_datetime(df["date"]).dt.date
+
+        # ----- Standardize zone name -----
+        if "zone" not in df.columns and "load_area" in df.columns:
+            df = df.rename(columns={"load_area": "zone"})
+
+        frames.append(df)
+
+    out = pd.concat(frames, ignore_index=True)
+
+    # Just in case: drop duplicate column names
+    out = out.loc[:, ~out.columns.duplicated()]
+
+    return out
+
+
+
+# ================================
+# Feature engineering helpers
+# ================================
+
+def build_regular_week_baseline(train: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build baseline table: mean mw per (zone, dow, hour, month).
+    """
+    df = train.copy()
+    df["dow"] = df["timestamp"].dt.dayofweek
+    df["month"] = df["timestamp"].dt.month
+    base = (
+        df.groupby(["zone", "dow", "hour", "month"])["mw"]
+        .mean()
+        .reset_index()
+        .rename(columns={"mw": "mw_base"})
+    )
+    return base
+
+
+def add_baseline_feature(df: pd.DataFrame, baseline_table: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["dow"] = df["timestamp"].dt.dayofweek
+    df["month"] = df["timestamp"].dt.month
+    df = df.merge(
+        baseline_table,
+        on=["zone", "dow", "hour", "month"],
+        how="left",
+    )
+    return df
+
+
+def add_lags(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(["zone", "timestamp"]).copy()
+    grp = df.groupby("zone")["mw"]
+    df["lag24"] = grp.shift(24)
+    df["lag168"] = grp.shift(168)
+    return df
+
+
+def add_thermal_inertia(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add short/long EWMA of temperature per zone.
+    """
+    df = df.sort_values(["zone", "timestamp"]).copy()
+    df["temp_ewm_short"] = (
+        df.groupby("zone")["temp_c"]
+        .transform(lambda s: s.ewm(span=12, min_periods=1).mean())
+    )
+    df["temp_ewm_long"] = (
+        df.groupby("zone")["temp_c"]
+        .transform(lambda s: s.ewm(span=72, min_periods=1).mean())
+    )
+    return df
+
+
+def build_thanksgiving_pattern(train_df: pd.DataFrame,
+                               actuals_full_df: pd.DataFrame,
+                               train_end_year: int) -> dict:
+    """
+    Build per-zone Thanksgiving-week pattern:
+    (zone, hours_from_thu) -> mean mw.
+    """
+    all_slices = []
+    years = list(range(2017, FORECAST_YEAR))  # up through 2024
+    for year in years:
+        if year <= train_end_year:
+            src = train_df[train_df["timestamp"].dt.year == year].copy()
+        else:
+            src = actuals_full_df[actuals_full_df["timestamp"].dt.year == year].copy()
+        if src.empty:
+            continue
+        tg = thanksgiving_date(year)
+        align_start = tg - timedelta(days=7)
+        start_ts = datetime.combine(align_start, datetime.min.time())
+        end_ts = start_ts + timedelta(days=14)
+        slice_df = src[(src["timestamp"] >= start_ts) & (src["timestamp"] <= end_ts)].copy()
+        if slice_df.empty:
+            continue
+        if "zone" not in slice_df.columns:
+            slice_df["zone"] = slice_df["load_area"]
+        slice_df["hours_from_thu"] = (
+            (slice_df["timestamp"] - start_ts).dt.total_seconds() / 3600.0
+        ).astype(int)
+        all_slices.append(slice_df[["zone", "hours_from_thu", "mw"]])
+
+    if not all_slices:
+        raise RuntimeError("No Thanksgiving slices found.")
+    cat = pd.concat(all_slices, ignore_index=True)
+    pattern = (
+        cat.groupby(["zone", "hours_from_thu"])["mw"]
+        .mean()
+        .to_dict()
+    )
+    return pattern
+
+
+def add_thanksgiving_feature(df: pd.DataFrame, pattern: dict,
+                             baseline_table: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add lag_thanksgiving feature, backed off to mw_base when pattern unavailable.
+    """
+    df = df.copy()
+    years = df["timestamp"].dt.year.unique()
+    align_starts = {y: thanksgiving_date(y) - timedelta(days=7) for y in years}
+    df["align_start"] = df["timestamp"].dt.year.map(align_starts).astype("datetime64[ns]")
+    df["hours_from_thu"] = (
+        (df["timestamp"] - df["align_start"]).dt.total_seconds() / 3600.0
+    ).astype(int)
+
+    pattern_series = pd.Series(pattern)
+    idx = list(zip(df["zone"], df["hours_from_thu"]))
+    df["lag_thanksgiving_raw"] = pattern_series.reindex(idx).to_numpy()
+
+    if "mw_base" not in df.columns:
+        df = add_baseline_feature(df, baseline_table)
+
+    df["lag_thanksgiving"] = df["lag_thanksgiving_raw"]
+    missing = df["lag_thanksgiving"].isna()
+    df.loc[missing, "lag_thanksgiving"] = df.loc[missing, "mw_base"]
+
+    return df.drop(columns=["align_start", "hours_from_thu", "lag_thanksgiving_raw"])
+
+
+# ================================
+# GP training (unified across zones)
+# ================================
+
+NUM_FEATURES = [
+    "hour",
+    "dow",
+    "month",
+    "is_weekend",
+    "temp_c",
+    "temp_c2",
+    "lag24",
+    "lag168",
+    "mw_base",
+    "lag_thanksgiving",
+    "temp_ewm_short",
+    "temp_ewm_long",
+]
+
+
+def train_unified_gp(global_train: pd.DataFrame) -> tuple[GaussianProcessRegressor, StandardScaler, list[str]]:
+    """
+    Train unified GP on years 2021–2024 using NUM_FEATURES + zone one-hot.
+
+    - Drops rows with NaNs in NUM_FEATURES or mw.
+    - Randomly subsamples to at most n_max rows to keep GP feasible.
+    """
+    # 1) Filter to years 2021–2024
+    mask_21_24 = (global_train["timestamp"].dt.year >= 2021) & (global_train["timestamp"].dt.year <= 2024)
+    gp_train_df = global_train.loc[mask_21_24].copy()
+    if gp_train_df.empty:
+        raise RuntimeError("No GP training rows after filtering 2021–2024.")
+
+    # 2) Keep only needed cols and drop NaNs
+    needed_cols = ["zone"] + NUM_FEATURES + ["mw"]
+    missing_cols = [c for c in needed_cols if c not in gp_train_df.columns]
+    if missing_cols:
+        raise RuntimeError(f"Missing expected columns in global_train for GP: {missing_cols}")
+
+    gp_train_small = gp_train_df[needed_cols].copy()
+    before = len(gp_train_small)
+    gp_train_small = gp_train_small.dropna(subset=NUM_FEATURES + ["mw"])
+    after = len(gp_train_small)
+    if after == 0:
+        raise RuntimeError("All GP training rows were dropped due to NaNs in features/target.")
+
+    print(f"GP training rows (after dropping NaNs): {after} (dropped {before - after})")
+
+    # 3) Subsample to keep GP tractable
+    n_max = 8000  # you can tweak this down/up if needed
+    if after > n_max:
+        rng = np.random.RandomState(0)
+        idx_sub = rng.choice(after, size=n_max, replace=False)
+        gp_train_small = gp_train_small.iloc[idx_sub].reset_index(drop=True)
+        print(f"Subsampled GP training rows to {len(gp_train_small)}")
+
+    # 4) One-hot encode zone
+    zone_dummies = pd.get_dummies(gp_train_small["zone"], prefix="zone")
+    X_train_full = pd.concat(
+        [gp_train_small[NUM_FEATURES].reset_index(drop=True),
+         zone_dummies.reset_index(drop=True)],
+        axis=1,
+    )
+    y_train_full = gp_train_small["mw"].to_numpy()
+    zone_dummy_cols = list(zone_dummies.columns)
+
+    # 5) Standardize and fit GP
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_train_full.to_numpy())
+
+    kernel = (
+        ConstantKernel(1.0, (0.1, 10.0))
+        * Matern(length_scale=1.0, nu=1.5)
+        + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-3, 1e3))
+    )
+
+    gpr = GaussianProcessRegressor(
+        kernel=kernel,
+        normalize_y=True,
+        n_restarts_optimizer=1,  # keep this small to avoid long optimize
+        random_state=0,
+    )
+
+    print("Fitting unified GP on", X_scaled.shape[0], "rows and", X_scaled.shape[1], "features...")
+    gpr.fit(X_scaled, y_train_full)
+    print("Unified GP kernel:", gpr.kernel_)
+
+    return gpr, scaler, zone_dummy_cols
+
+
+
+
+# ================================
+# Sequential forecast helper
+# ================================
+
+def make_gp_features_for_timestamp(row, mw_lookup, zone_dummy_cols):
+    """
+    Build unified GP feature vector for a (zone, timestamp) row, using mw_lookup for lag24/lag168.
+    """
+    z = row["zone"]
+    ts = row["timestamp"]
+
+    ts_lag24 = ts - timedelta(hours=24)
+    ts_lag168 = ts - timedelta(hours=168)
+
+    lag24_val = mw_lookup.get((z, ts_lag24), row["mw_base"])
+    lag168_val = mw_lookup.get((z, ts_lag168), row["mw_base"])
+
+    dow = ts.dayofweek
+    month = ts.month
+    is_weekend = 1 if dow in [5, 6] else 0
+    temp = row["temp_c"]
+
+    num_vals = [
+        row["hour"],
+        dow,
+        month,
+        is_weekend,
+        temp,
+        temp ** 2,
+        lag24_val,
+        lag168_val,
+        row["mw_base"],
+        row["lag_thanksgiving"],
+        row["temp_ewm_short"],
+        row["temp_ewm_long"],
+    ]
+
+    zone_dummy = pd.Series(0.0, index=zone_dummy_cols, dtype=float)
+    colname = f"zone_{z}"
+    if colname in zone_dummy.index:
+        zone_dummy[colname] = 1.0
+
+    feat = np.concatenate([np.array(num_vals, dtype=float), zone_dummy.to_numpy()])
+    return feat
+
+
+# ================================
+# Main prediction pipeline
+# ================================
+
+def main():
+    # ----------------------------------
+    # 1) Load metered + weather
+    # ----------------------------------
+    all_metered = load_metered_data(METERED_DIR)
+    weather_df = load_weather_data(WEATHER_DIR)
+
+    # drop RTO if present
+    all_metered = all_metered[all_metered["zone"] != "RTO"].copy()
+
+    # ----------------------------------
+    # 2) Training and actual frames
+    # ----------------------------------
+    train_df = all_metered[
+        (all_metered["date"] >= TRAIN_START) &
+        (all_metered["date"] <= TRAIN_END)
+    ].copy()
+
+    # we need full 2024 + 2025 for Thanksgiving / Nov 2025 logic
+    actuals_full_df = all_metered[
+        all_metered["timestamp"].dt.year.isin([2024, FORECAST_YEAR])
+    ].copy()
+
+    # merge weather
+    train_merged = train_df.merge(
+        weather_df[["zone", "timestamp", "temp_c"]],
+        on=["zone", "timestamp"],
+        how="left",
+    )
+    actuals_full_merged = actuals_full_df.merge(
+        weather_df[["zone", "timestamp", "temp_c"]],
+        on=["zone", "timestamp"],
+        how="left",
+    )
+
+    # ----------------------------------
+    # 3) Baseline + features for training (2016–2023)
+    # ----------------------------------
+    baseline_table = build_regular_week_baseline(train_merged)
+
+    train_feat = add_baseline_feature(train_merged, baseline_table)
+    train_feat = add_lags(train_feat)
+
+    thank_pattern = build_thanksgiving_pattern(train_feat, actuals_full_merged, TRAIN_END.year)
+
+    train_feat = add_thanksgiving_feature(train_feat, thank_pattern, baseline_table)
+    train_feat = add_thermal_inertia(train_feat)
+
+    # ----------------------------------
+    # 3b) Build 2024 feature frame
+    # ----------------------------------
+    actuals_2024 = actuals_full_merged[
+        actuals_full_merged["timestamp"].dt.year == 2024
+    ].copy()
+
+    actuals_2024_feat = add_baseline_feature(actuals_2024, baseline_table)
+    actuals_2024_feat = add_lags(actuals_2024_feat)
+    actuals_2024_feat = add_thanksgiving_feature(actuals_2024_feat, thank_pattern, baseline_table)
+    actuals_2024_feat = add_thermal_inertia(actuals_2024_feat)
+
+    # ----------------------------------
+    # 3c) Global training frame = 2016–2023 train_feat + 2024 actuals
+    # ----------------------------------
+    global_train = pd.concat(
+        [train_feat, actuals_2024_feat],
+        ignore_index=True,
+    )
+
+    # Add calendar + temp^2 for all rows in global_train
+    ts = global_train["timestamp"]
+    global_train["hour"] = ts.dt.hour
+    global_train["dow"] = ts.dt.dayofweek
+    global_train["month"] = ts.dt.month
+    global_train["is_weekend"] = global_train["dow"].isin([5, 6]).astype(int)
+    global_train["temp_c2"] = global_train["temp_c"] ** 2
+
+    # ----------------------------------
+    # 4) Train unified GP (filters to 2021–2024 internally)
+    # ----------------------------------
+    gpr, scaler_gp_forecast, zone_dummy_cols_fore = train_unified_gp(global_train)
+
+        # ----------------------------------
+    # Save training artifacts for prediction
+    # ----------------------------------
+
+
+    ARTIFACT_DIR = Path(os.environ.get("ARTIFACT_DIR", "data/artifacts"))
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    ARTIFACT_PATH = ARTIFACT_DIR / "gp_artifacts.joblib"
+
+    joblib.dump(
+        {
+            "gpr": gpr,
+            "scaler": scaler_gp_forecast,
+            "zone_dummy_cols": zone_dummy_cols_fore,
+            "baseline_table": baseline_table,
+            "thank_pattern": thank_pattern,
+        },
+        ARTIFACT_PATH,
+    )
+    print(f"Saved GP artifacts to {ARTIFACT_PATH}")
+
+    # # ----------------------------------
+    # # 5) Build Nov 2025 future grid
+    # # ----------------------------------
+    # full_hours = pd.date_range(
+    #     datetime(FORECAST_YEAR, 11, 1, 0, 0, 0),
+    #     datetime(FORECAST_YEAR, 11, 29, 23, 0, 0),
+    #     freq="H",
+    # )
+
+    # zones_all = sorted(train_df["zone"].unique())
+    # future_rows = []
+    # for z in zones_all:
+    #     for ts_future in full_hours:
+    #         future_rows.append({"zone": z, "timestamp": ts_future})
+
+    # future_df = pd.DataFrame(future_rows)
+    # future_df["date"] = future_df["timestamp"].dt.date
+    # future_df["hour"] = future_df["timestamp"].dt.hour
+
+    # # attach observed mw for Nov 1–13, 2025 (if present)
+    # nov_obs = all_metered[
+    #     (all_metered["timestamp"].dt.year == FORECAST_YEAR) &
+    #     (all_metered["timestamp"].dt.month == 11) &
+    #     (all_metered["date"] <= date(FORECAST_YEAR, 11, 13))
+    # ][["zone", "timestamp", "mw"]].copy()
+
+    # future_df = future_df.merge(
+    #     nov_obs,
+    #     on=["zone", "timestamp"],
+    #     how="left",
+    # )
+
+    # # attach weather for Nov 2025
+    # weather_2025 = weather_df[
+    #     (weather_df["date"] >= NOV_START) &
+    #     (weather_df["date"] <= date(FORECAST_YEAR, 11, 30))
+    # ].copy()
+
+    # future_df = future_df.merge(
+    #     weather_2025[["zone", "timestamp", "temp_c"]],
+    #     on=["zone", "timestamp"],
+    #     how="left",
+    # )
+
+    # # baseline + Thanksgiving + thermal inertia for future
+    # future_df = add_baseline_feature(future_df, baseline_table)
+    # future_df = add_thanksgiving_feature(future_df, thank_pattern, baseline_table)
+    # future_df = add_thermal_inertia(future_df)
+
+    # # ----------------------------------
+    # # 6) Fill Nov 14–19 with baseline
+    # # ----------------------------------
+    # mask_gap = (
+    #     (future_df["date"] >= date(FORECAST_YEAR, 11, 14)) &
+    #     (future_df["date"] <= date(FORECAST_YEAR, 11, 19)) &
+    #     (future_df["mw"].isna())
+    # )
+    # future_df.loc[mask_gap, "mw"] = future_df.loc[mask_gap, "mw_base"]
+
+    # # ----------------------------------
+    # # 7) Initialize mw_lookup with actual / baseline up to 19th
+    # # ----------------------------------
+    # mw_lookup = {}
+    # cutoff_ts = datetime(FORECAST_YEAR, 11, 19, 23, 0, 0)
+    # for _, row in future_df.iterrows():
+    #     ts_row = row["timestamp"]
+    #     if ts_row <= cutoff_ts:
+    #         mw_lookup[(row["zone"], ts_row)] = row["mw"]
+
+    # # also need calendar features + temp_c2 in future_df
+    # ts_future_all = future_df["timestamp"]
+    # future_df["hour"] = ts_future_all.dt.hour
+    # future_df["dow"] = ts_future_all.dt.dayofweek
+    # future_df["month"] = ts_future_all.dt.month
+    # future_df["is_weekend"] = future_df["dow"].isin([5, 6]).astype(int)
+    # future_df["temp_c2"] = future_df["temp_c"] ** 2
+
+    # # ----------------------------------
+    # # 8) Sequential forecast for Nov 20–29
+    # # ----------------------------------
+    # forecast_start_ts = datetime(FORECAST_YEAR, 11, 20, 0, 0, 0)
+    # forecast_end_ts = datetime(FORECAST_YEAR, 11, 29, 23, 0, 0)
+
+    # pred_rows = []
+
+    # for z in zones_all:
+    #     mask_zone = (
+    #         (future_df["zone"] == z) &
+    #         (future_df["timestamp"] >= forecast_start_ts) &
+    #         (future_df["timestamp"] <= forecast_end_ts)
+    #     )
+    #     zone_future = future_df.loc[mask_zone].sort_values("timestamp").copy()
+
+    #     for _, row in zone_future.iterrows():
+    #         feat_vec = make_gp_features_for_timestamp(row, mw_lookup, zone_dummy_cols_fore)
+    #         X_scaled = scaler_gp_forecast.transform(feat_vec.reshape(1, -1))
+    #         mw_pred = gpr.predict(X_scaled)[0]
+    #         ts_row = row["timestamp"]
+    #         pred_rows.append({
+    #             "zone": z,
+    #             "timestamp": ts_row,
+    #             "date": ts_row.date(),
+    #             "hour": ts_row.hour,
+    #             "mw_pred_gp_forecast": mw_pred,
+    #         })
+    #         mw_lookup[(z, ts_row)] = mw_pred  # for later lags
+
+    # forecast_pred_df = pd.DataFrame(pred_rows)
+
+    # # ----------------------------------
+    # # 9) Decide which date to output based on "today"
+    # # ----------------------------------
+    # today = datetime.now().date()
+
+    # if today <= date(FORECAST_YEAR, 11, 18):
+    #     target_date = date(FORECAST_YEAR, 11, 20)
+    # elif date(FORECAST_YEAR, 11, 19) <= today <= date(FORECAST_YEAR, 11, 28):
+    #     target_date = today + timedelta(days=1)
+    # else:
+    #     # Should not happen per your note; cap at 29
+    #     target_date = date(FORECAST_YEAR, 11, 29)
+
+    # target_df = forecast_pred_df[forecast_pred_df["date"] == target_date].copy()
+    # if target_df.empty:
+    #     raise RuntimeError(f"No forecasts found for target date {target_date}.")
+
+    # # ----------------------------------
+    # # 10) Build output in required format
+    # # ----------------------------------
+    # # Rename zone -> load_area, and set peak hour & peak day flags
+    # target_df = target_df.rename(columns={"zone": "load_area", "mw_pred_gp_forecast": "mw"})
+
+    # # peak hour per zone: where mw is maximum that day
+    # target_df["is_peak_hour"] = 0
+    # for la in target_df["load_area"].unique():
+    #     sub = target_df[target_df["load_area"] == la]
+    #     if sub.empty:
+    #         continue
+    #     max_idx = sub["mw"].idxmax()
+    #     target_df.loc[max_idx, "is_peak_hour"] = 1
+
+    # # peak day: you said just put 0
+    # target_df["is_peak_day"] = 0
+
+    # # Final column order
+    # out = target_df[["date", "hour", "load_area", "mw", "is_peak_hour", "is_peak_day"]].copy()
+
+    # # Print CSV to stdout (no index)
+    # out.to_csv(os.sys.stdout, index=False)
+
+
+if __name__ == "__main__":
+    main()

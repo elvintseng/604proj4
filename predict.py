@@ -94,21 +94,18 @@ def load_metered_data(metered_dir: Path) -> pd.DataFrame:
 
 
 def load_weather_data(weather_dir: Path) -> pd.DataFrame:
-    """
-    Load precomputed weather CSVs from data/weather_cities.
+    combined_path = weather_dir / "weather_all_zones.csv"
 
-    We assume each file has at least:
-      - zone
-      - either:
-          - timestamp (datetime-like), or
-          - date + hour columns
-      - temperature column 'temp_c'
-    """
-    csvs = sorted(weather_dir.glob("*.csv"))
+    if combined_path.exists():
+        csvs = [combined_path]
+    else:
+        csvs = sorted(weather_dir.glob("weather_*.csv"))
+
     if not csvs:
         raise FileNotFoundError(f"No weather CSVs found in {weather_dir}")
 
     frames = []
+
     for f in csvs:
         df = pd.read_csv(f)
 
@@ -122,29 +119,36 @@ def load_weather_data(weather_dir: Path) -> pd.DataFrame:
                 raise ValueError(
                     f"{f} has no 'timestamp' and no ('date','hour') to construct it."
                 )
-        else:
-            # If timestamp exists, force it to datetime
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        # 1) Parse with UTC to handle mixed offsets cleanly
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+        # 2) Convert to America/New_York (PJM local time)
+        df["timestamp"] = (
+            df["timestamp"]
+            .dt.tz_convert("America/New_York")
+            .dt.tz_localize(None)   # make it tz-naive to match load data
+        )
 
         # ----- Standardize date -----
-        if "date" not in df.columns:
-            df["date"] = df["timestamp"].dt.date
-        else:
-            df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["date"] = df["timestamp"].dt.date
 
         # ----- Standardize zone name -----
         if "zone" not in df.columns and "load_area" in df.columns:
             df = df.rename(columns={"load_area": "zone"})
 
-        frames.append(df)
+        # Make sure we have temp_c (in case you later change fetch_weather)
+        if "temp_c" not in df.columns and "temp" in df.columns:
+            df = df.rename(columns={"temp": "temp_c"})
+
+        frames.append(df[["zone", "timestamp", "date", "temp_c"]])
 
     out = pd.concat(frames, ignore_index=True)
 
-    # Just in case: drop duplicate column names
-    out = out.loc[:, ~out.columns.duplicated()]
+    # Remove duplicates in case of overlapping files
+    out = out.drop_duplicates(subset=["zone", "timestamp"]).reset_index(drop=True)
 
     return out
-
 
 
 # ================================
@@ -270,6 +274,44 @@ def add_thanksgiving_feature(df: pd.DataFrame, pattern: dict,
 
     return df.drop(columns=["align_start", "hours_from_thu", "lag_thanksgiving_raw"])
 
+# ================================
+# Task 2: Smoothed peak-hour prediction
+# ================================
+
+PEAK_HOUR_SMOOTH_ALPHA: float = 0.75  # tuned smoothing parameter
+
+
+def _smoothed_scores(loads: np.ndarray,
+                     alpha: float = PEAK_HOUR_SMOOTH_ALPHA) -> np.ndarray:
+    """
+    Compute smoothed scores S_h = L_h + alpha * mean(neighbor loads).
+
+    Parameters
+    ----------
+    loads : np.ndarray of shape (24,)
+        Predicted loads for a single day (hours 0..23).
+    alpha : float
+        Smoothing parameter. alpha=0 gives plain loads.
+
+    Returns
+    -------
+    scores : np.ndarray of shape (24,)
+        Smoothed scores.
+    """
+    scores = loads.astype(float).copy()
+    if alpha <= 0:
+        return scores
+
+    H = len(loads)
+    for h in range(H):
+        neighbors = []
+        if h > 0:
+            neighbors.append(loads[h - 1])
+        if h < H - 1:
+            neighbors.append(loads[h + 1])
+        if neighbors:
+            scores[h] += alpha * (sum(neighbors) / len(neighbors))
+    return scores
 
 # ================================
 # GP training (unified across zones)
@@ -343,7 +385,7 @@ def train_unified_gp(global_train: pd.DataFrame) -> tuple[GaussianProcessRegress
 
     kernel = (
         ConstantKernel(1.0, (0.1, 10.0))
-        * Matern(length_scale=1.0, nu=1.5)
+        * Matern(length_scale=1.0, nu=2.5)
         + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-3, 1e3))
     )
 
@@ -654,6 +696,30 @@ def main():
             mw_lookup[(z, ts_row)] = mw_pred  # for later lags
 
     forecast_pred_df = pd.DataFrame(pred_rows)
+        # ----------------------------------
+    # Task 3: Pre-compute predicted peak days (top-2 daily maxima per zone)
+    # ----------------------------------
+    # Daily max predicted load per (zone, date)
+    daily_max = (
+        forecast_pred_df
+        .groupby(["zone", "date"], as_index=False)["mw_pred_gp_forecast"]
+        .max()
+        .rename(columns={"mw_pred_gp_forecast": "mw_daily_max"})
+    )
+
+    # Rank days within each zone by descending daily max (1 = highest)
+    daily_max["rank"] = daily_max.groupby("zone")["mw_daily_max"].rank(
+        method="first", ascending=False
+    )
+
+    # Keep top-2 days per zone as predicted peak days
+    peak_day_df = daily_max[daily_max["rank"] <= 2].copy()
+
+    # Build a mapping: zone -> set of predicted peak dates
+    zone_peak_dates: dict[str, set[date]] = {}
+    for z, sub in peak_day_df.groupby("zone"):
+        zone_peak_dates[z] = set(sub["date"])
+
 
     # ----------------------------------
     # 9) Decide which date to output based on "today"
@@ -685,33 +751,40 @@ def main():
     zone_order = sorted(day_pred["zone"].unique())
     n_zones = len(zone_order)
 
-    # 10c) Collect loads Lk_hh (rounded), peak hours PH_k, and peak-day flags PD_k (all 0 for now)
+        # 10c) Collect loads Lk_hh (rounded), smoothed peak hours PH_k, and peak-day flags PD_k (all 0 for now)
     L_values = []   # length = n_zones * 24
     PH_values = []  # length = n_zones
     PD_values = []  # length = n_zones
 
     for z in zone_order:
         sub = day_pred[day_pred["zone"] == z].copy()
-        # index by hour for convenient lookup
         loads_by_hour = sub.set_index("hour")["mw_pred_gp_forecast"]
 
-        # 24 loads for this zone, hours 0..23
+        # Build a dense 24-hour vector of loads with fallback to mean if any hour is missing
+        loads_vec = []
+        mean_val = float(loads_by_hour.mean()) if not loads_by_hour.empty else 0.0
         for h in range(24):
             val = loads_by_hour.get(h, np.nan)
-            # in practice there should be no NaNs here; just in case, fall back to mean
             if pd.isna(val):
-                val = loads_by_hour.mean()
+                val = mean_val
+            loads_vec.append(float(val))
+        loads_vec = np.array(loads_vec, dtype=float)
+
+        # Append rounded loads to L_values (Task 1 output)
+        for val in loads_vec:
             L_values.append(int(round(val)))
 
-        # peak hour = argmax over the 24 hours (0..23)
-        if not loads_by_hour.empty:
-            ph = int(loads_by_hour.idxmax())
-        else:
-            ph = 0
+        # Task 2: smoothed peak hour with alpha = 0.75
+        scores = _smoothed_scores(loads_vec, alpha=PEAK_HOUR_SMOOTH_ALPHA)
+        ph = int(np.argmax(scores))  # hour in {0,...,23}
         PH_values.append(ph)
 
-        # peak-day flag PD_k: baseline 0
-        PD_values.append(0)
+        # Task 3 (peak day) placeholder: all zeros for now
+        if z in zone_peak_dates and target_date in zone_peak_dates[z]:
+            PD_values.append(1)
+        else:
+            PD_values.append(0)
+
 
     # 10d) Current date (today) for the first field
     today_str = datetime.now().strftime("%Y-%m-%d")

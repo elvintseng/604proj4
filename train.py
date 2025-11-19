@@ -90,21 +90,18 @@ def load_metered_data(metered_dir: Path) -> pd.DataFrame:
 
 
 def load_weather_data(weather_dir: Path) -> pd.DataFrame:
-    """
-    Load precomputed weather CSVs from data/weather_cities.
+    combined_path = weather_dir / "weather_all_zones.csv"
 
-    We assume each file has at least:
-      - zone
-      - either:
-          - timestamp (datetime-like), or
-          - date + hour columns
-      - temperature column 'temp_c'
-    """
-    csvs = sorted(weather_dir.glob("*.csv"))
+    if combined_path.exists():
+        csvs = [combined_path]
+    else:
+        csvs = sorted(weather_dir.glob("weather_*.csv"))
+
     if not csvs:
         raise FileNotFoundError(f"No weather CSVs found in {weather_dir}")
 
     frames = []
+
     for f in csvs:
         df = pd.read_csv(f)
 
@@ -118,26 +115,34 @@ def load_weather_data(weather_dir: Path) -> pd.DataFrame:
                 raise ValueError(
                     f"{f} has no 'timestamp' and no ('date','hour') to construct it."
                 )
-        else:
-            # If timestamp exists, force it to datetime
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        # 1) Parse with UTC to handle mixed offsets cleanly
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+        # 2) Convert to America/New_York (PJM local time)
+        df["timestamp"] = (
+            df["timestamp"]
+            .dt.tz_convert("America/New_York")
+            .dt.tz_localize(None)   # make it tz-naive to match load data
+        )
 
         # ----- Standardize date -----
-        if "date" not in df.columns:
-            df["date"] = df["timestamp"].dt.date
-        else:
-            df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["date"] = df["timestamp"].dt.date
 
         # ----- Standardize zone name -----
         if "zone" not in df.columns and "load_area" in df.columns:
             df = df.rename(columns={"load_area": "zone"})
 
-        frames.append(df)
+        # Make sure we have temp_c (in case you later change fetch_weather)
+        if "temp_c" not in df.columns and "temp" in df.columns:
+            df = df.rename(columns={"temp": "temp_c"})
+
+        frames.append(df[["zone", "timestamp", "date", "temp_c"]])
 
     out = pd.concat(frames, ignore_index=True)
 
-    # Just in case: drop duplicate column names
-    out = out.loc[:, ~out.columns.duplicated()]
+    # Remove duplicates in case of overlapping files
+    out = out.drop_duplicates(subset=["zone", "timestamp"]).reset_index(drop=True)
 
     return out
 
@@ -339,7 +344,7 @@ def train_unified_gp(global_train: pd.DataFrame) -> tuple[GaussianProcessRegress
 
     kernel = (
         ConstantKernel(1.0, (0.1, 10.0))
-        * Matern(length_scale=1.0, nu=1.5)
+        * Matern(length_scale=1.0, nu=2.5)
         + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-3, 1e3))
     )
 

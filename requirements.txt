@@ -5,5 +5,5 @@ requests==2.31.0
 scikit-learn==1.5.1
 numpy==1.26.4
 matplotlib==3.8.4
-meteostat==1.6.5
+meteostat
 pgeocode==0.5.0

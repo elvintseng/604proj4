@@ -12,6 +12,14 @@ import joblib
 ARTIFACT_DIR = Path(os.environ.get("ARTIFACT_DIR", "data/artifacts"))
 ARTIFACT_PATH = ARTIFACT_DIR / "gp_artifacts.joblib"
 
+ZONES = [
+    "AECO", "AEPAPT", "AEPIMP", "AEPKPT", "AEPOPT",
+    "AP", "BC", "CE", "DAY", "DEOK", "DOM", "DPLCO", "DUQ",
+    "EASTON", "EKPC", "JC", "ME", "OE", "OVEC", "PAPWR",
+    "PE", "PEPCO", "PLCO", "PN", "PS", "RECO", "SMECO",
+    "UGI", "VMEU",
+]
+
 
 # ================================
 # Configuration
@@ -412,6 +420,7 @@ def train_unified_gp(global_train: pd.DataFrame) -> tuple[GaussianProcessRegress
 def make_gp_features_for_timestamp(row, mw_lookup, zone_dummy_cols):
     """
     Build unified GP feature vector for a (zone, timestamp) row, using mw_lookup for lag24/lag168.
+    NaNs in lags or temp are safely backed off to mw_base / EWM means.
     """
     z = row["zone"]
     ts = row["timestamp"]
@@ -419,36 +428,63 @@ def make_gp_features_for_timestamp(row, mw_lookup, zone_dummy_cols):
     ts_lag24 = ts - timedelta(hours=24)
     ts_lag168 = ts - timedelta(hours=168)
 
-    lag24_val = mw_lookup.get((z, ts_lag24), row["mw_base"])
-    lag168_val = mw_lookup.get((z, ts_lag168), row["mw_base"])
+    base = row["mw_base"]
 
+    # --- lag24 / lag168 with NaN-safe fallback ---
+    lag24_val = mw_lookup.get((z, ts_lag24), base)
+    lag168_val = mw_lookup.get((z, ts_lag168), base)
+
+    if pd.isna(lag24_val):
+        lag24_val = base
+    if pd.isna(lag168_val):
+        lag168_val = base
+
+    # --- calendar features ---
     dow = ts.dayofweek
     month = ts.month
     is_weekend = 1 if dow in [5, 6] else 0
+
+    # --- temperature: extra safety, though impute_future_features already filled it ---
     temp = row["temp_c"]
+    if pd.isna(temp):
+        # try short EWM as fallback
+        temp = row.get("temp_ewm_short", np.nan)
+    if pd.isna(temp):
+        # last resort: 0
+        temp = 0.0
 
     num_vals = [
         row["hour"],
         dow,
         month,
         is_weekend,
-        temp,
-        temp ** 2,
-        lag24_val,
-        lag168_val,
-        row["mw_base"],
-        row["lag_thanksgiving"],
-        row["temp_ewm_short"],
-        row["temp_ewm_long"],
+        float(temp),
+        float(temp) ** 2,
+        float(lag24_val),
+        float(lag168_val),
+        float(row["mw_base"]),
+        float(row["lag_thanksgiving"]),
+        float(row["temp_ewm_short"]),
+        float(row["temp_ewm_long"]),
     ]
 
+    # zone one-hot
     zone_dummy = pd.Series(0.0, index=zone_dummy_cols, dtype=float)
     colname = f"zone_{z}"
     if colname in zone_dummy.index:
         zone_dummy[colname] = 1.0
 
     feat = np.concatenate([np.array(num_vals, dtype=float), zone_dummy.to_numpy()])
+
+    # Debug guard: if anything is still NaN, blow up *here* with context
+    if np.isnan(feat).any():
+        raise RuntimeError(
+            f"NaNs in feature vector for zone {z}, ts {ts}. "
+            f"num_vals={num_vals}"
+        )
+
     return feat
+
 
 def impute_future_features(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -589,16 +625,17 @@ def main():
     # 5) Build Nov 2025 future grid
     # ----------------------------------
     full_hours = pd.date_range(
-        datetime(FORECAST_YEAR, 11, 1, 0, 0, 0),
-        datetime(FORECAST_YEAR, 11, 29, 23, 0, 0),
-        freq="h",
+    datetime(FORECAST_YEAR, 11, 1, 0, 0, 0),
+    datetime(FORECAST_YEAR, 11, 29, 23, 0, 0),
+    freq="h",
     )
 
-    zones_all = sorted(train_df["zone"].unique())
+    zones_all = ZONES  # fixed 29 zones in contest order
     future_rows = []
     for z in zones_all:
         for ts_future in full_hours:
             future_rows.append({"zone": z, "timestamp": ts_future})
+
 
     future_df = pd.DataFrame(future_rows)
     future_df["date"] = future_df["timestamp"].dt.date
@@ -747,14 +784,13 @@ def main():
     if day_pred.empty:
         raise RuntimeError(f"No forecasts found for target date {target_date}.")
 
-    # 10b) Decide zone order (1..K). Use sorted zone names to make it deterministic.
-    zone_order = sorted(day_pred["zone"].unique())
+    # Fixed 29-zone order
+    zone_order = ZONES
     n_zones = len(zone_order)
+    L_values = []
+    PH_values = []
+    PD_values = []
 
-        # 10c) Collect loads Lk_hh (rounded), smoothed peak hours PH_k, and peak-day flags PD_k (all 0 for now)
-    L_values = []   # length = n_zones * 24
-    PH_values = []  # length = n_zones
-    PD_values = []  # length = n_zones
 
     for z in zone_order:
         sub = day_pred[day_pred["zone"] == z].copy()

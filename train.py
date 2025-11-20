@@ -9,6 +9,15 @@ from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
 import joblib
 
+ZONES = [
+    "AECO", "AEPAPT", "AEPIMP", "AEPKPT", "AEPOPT",
+    "AP", "BC", "CE", "DAY", "DEOK", "DOM", "DPLCO", "DUQ",
+    "EASTON", "EKPC", "JC", "ME", "OE", "OVEC", "PAPWR",
+    "PE", "PEPCO", "PLCO", "PN", "PS", "RECO", "SMECO",
+    "UGI", "VMEU",
+]
+
+
 # ================================
 # Configuration
 # ================================
@@ -321,7 +330,7 @@ def train_unified_gp(global_train: pd.DataFrame) -> tuple[GaussianProcessRegress
     print(f"GP training rows (after dropping NaNs): {after} (dropped {before - after})")
 
     # 3) Subsample to keep GP tractable
-    n_max = 8000  # you can tweak this down/up if needed
+    n_max = 10000  # you can tweak this down/up if needed
     if after > n_max:
         rng = np.random.RandomState(0)
         idx_sub = rng.choice(after, size=n_max, replace=False)
@@ -423,6 +432,16 @@ def main():
 
     # drop RTO if present
     all_metered = all_metered[all_metered["zone"] != "RTO"].copy()
+
+    # Ensure we have exactly the 29 contest zones
+    present_zones = sorted(all_metered["zone"].unique())
+    missing = set(ZONES) - set(present_zones)
+    extra   = set(present_zones) - set(ZONES)
+    if missing:
+        print("WARNING: missing zones in metered data:", sorted(missing))
+    if extra:
+        print("WARNING: unexpected zones in metered data:", sorted(extra))
+
 
     # ----------------------------------
     # 2) Training and actual frames

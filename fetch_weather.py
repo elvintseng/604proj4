@@ -6,6 +6,14 @@ import pandas as pd
 from meteostat import Hourly, Point
 import pgeocode
 
+ZONES = [
+    "AECO", "AEPAPT", "AEPIMP", "AEPKPT", "AEPOPT",
+    "AP", "BC", "CE", "DAY", "DEOK", "DOM", "DPLCO", "DUQ",
+    "EASTON", "EKPC", "JC", "ME", "OE", "OVEC", "PAPWR",
+    "PE", "PEPCO", "PLCO", "PN", "PS", "RECO", "SMECO",
+    "UGI", "VMEU",
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -101,6 +109,12 @@ def main():
 
     mapping_path = Path(args.mapping)
     mapping = load_zone_mapping(mapping_path)
+
+    # Keep only the 29 contest zones, in a fixed order
+    mapping = mapping[mapping["zone"].isin(ZONES)].copy()
+    mapping["zone"] = pd.Categorical(mapping["zone"], categories=ZONES, ordered=True)
+    mapping = mapping.sort_values("zone")
+
 
     all_frames = []
 

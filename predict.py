@@ -52,9 +52,12 @@ def load_metered_data(metered_dir: Path) -> pd.DataFrame:
     """
     Load all hrl_load_metered_*.csv into one DataFrame.
 
-    Expected columns:
+    We *always* treat the PJM 'load_area' column as the canonical zone name
+    (AECO, AEPAPT, ...). Any existing 'zone' column in the raw files is ignored.
+
+    Expected columns in each CSV:
       - datetime_beginning_ept
-      - load_area (or zone)
+      - load_area
       - mw
     """
     csvs = sorted(metered_dir.glob("hrl_load_metered_*.csv"))
@@ -64,20 +67,22 @@ def load_metered_data(metered_dir: Path) -> pd.DataFrame:
     frames = []
     for f in csvs:
         df = pd.read_csv(f)
-
-        # Standardize zone column
         cols = df.columns
 
-        # If both 'zone' and 'load_area' exist, drop one and keep a single name
-        if "zone" in cols and "load_area" in cols:
-            # assume 'load_area' is redundant in that case
-            df = df.drop(columns=["load_area"])
+        # ---- Enforce use of load_area ----
+        if "load_area" not in cols:
+            raise ValueError(
+                f"{f} does not have 'load_area' column. "
+                "All metered files must provide load_area; "
+                "do not rely on the short 'zone' codes (AE, AEP, ...)."
+            )
 
-        if "zone" not in df.columns:
-            if "load_area" in df.columns:
-                df = df.rename(columns={"load_area": "zone"})
-            else:
-                raise ValueError(f"{f} has neither 'zone' nor 'load_area' column")
+        # If a short 'zone' column is present, drop it so we never use it
+        if "zone" in cols:
+            df = df.drop(columns=["zone"])
+
+        # Rename load_area -> zone for internal consistency
+        df = df.rename(columns={"load_area": "zone"})
 
         # Parse PJM timestamp
         if "timestamp" not in df.columns:
@@ -98,6 +103,7 @@ def load_metered_data(metered_dir: Path) -> pd.DataFrame:
     out = out.loc[:, ~out.columns.duplicated()]
 
     return out
+
 
 
 
